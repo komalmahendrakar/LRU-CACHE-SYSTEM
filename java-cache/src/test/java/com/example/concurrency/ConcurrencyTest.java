@@ -50,7 +50,12 @@ class ConcurrencyTest {
         for (int t = 0; t < threadCount; t++) {
             final int threadId = t;
             futures.add(pool.submit(() -> {
-                startGun.await();
+                try {
+                    startGun.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new RuntimeException("Interrupted while waiting to start", e);
+                }
                 for (int i = 0; i < opsPerThread; i++) {
                     // A bounded, overlapping key range exercises contention
                     // and eviction instead of allowing every write to remain.
