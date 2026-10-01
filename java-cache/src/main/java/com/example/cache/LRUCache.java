@@ -105,7 +105,7 @@ public class LRUCache<K, V> implements Cache<K, V> {
         }
 
         // Lazy TTL check — same passive-expiration logic as the JS version
-        if (node.expiresAt > 0 && clock.millis() > node.expiresAt) {
+        if (node.expiresAt > 0 && clock.millis() >= node.expiresAt) {
             removeNode(node);
             map.remove(key);
             misses++;

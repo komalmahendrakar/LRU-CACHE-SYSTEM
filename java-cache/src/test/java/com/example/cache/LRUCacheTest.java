@@ -128,7 +128,7 @@ class LRUCacheTest {
     class TTL {
 
         @Test
-        @DisplayName("4. Should return null after TTL expires")
+        @DisplayName("4. Should expire an entry at its TTL deadline")
         void ttlExpiry() {
             FakeClock clock = new FakeClock(1_000_000);
             LRUCache<String, Integer> cache = new LRUCache<>(2, clock);
@@ -136,8 +136,10 @@ class LRUCacheTest {
             cache.put("a", 1, 1000); // TTL = 1 second
             assertEquals(1, cache.get("a"), "Within TTL — should return value");
 
-            clock.advance(1001); // advance past expiry
-            assertNull(cache.get("a"), "After TTL — should return null");
+            clock.advance(1000); // exactly the expiration deadline
+            assertNull(cache.get("a"), "At the TTL deadline — should be expired");
+            assertEquals(1, cache.stats().misses(), "Expired lookups count as misses");
+            assertEquals(0, cache.size(), "Expired entry should be removed on access");
         }
 
         @Test
