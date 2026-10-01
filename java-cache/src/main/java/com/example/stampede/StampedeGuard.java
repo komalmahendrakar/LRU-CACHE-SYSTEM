@@ -15,7 +15,7 @@ import java.util.function.Function;
  * <h3>How it works</h3>
  * <ol>
  *   <li>On a cache miss, we atomically place a {@link CompletableFuture}
- *       into an in-flight map via {@code computeIfAbsent}.</li>
+ *       into an in-flight map via {@code putIfAbsent}.</li>
  *   <li>Only the thread that "wins" the {@code computeIfAbsent} race
  *       triggers the backend call; every other thread receives the
  *       same future and simply waits on it.</li>
@@ -33,10 +33,9 @@ import java.util.function.Function;
  * computations — cleaner typing, same deduplication semantics.
  *
  * <h3>Thread safety</h3>
- * {@code ConcurrentHashMap.computeIfAbsent} is atomic — the lambda
- * runs exactly once per key, even under concurrent access.  A naive
- * "check-then-act" pattern (if !map.containsKey → map.put) would be
- * a race condition and is explicitly avoided.
+ * {@code ConcurrentHashMap.putIfAbsent} atomically selects one
+ * placeholder future per key. The loader is scheduled only by the
+ * caller that inserted that future, avoiding a check-then-act race.
  */
 public class StampedeGuard<K, V> {
 
@@ -73,21 +72,39 @@ public class StampedeGuard<K, V> {
             return cached;
         }
 
-        // 2. Slow path — miss.  Use computeIfAbsent to guarantee
-        //    only ONE future is created per key.
-        CompletableFuture<V> future = inFlight.computeIfAbsent(key, k ->
-            CompletableFuture.supplyAsync(() -> {
-                V value = loader.apply(k);
-                // Store result in the real cache (with default TTL = 0)
-                cache.put(k, value, 0);
-                return value;
-            }, executor)
-            .whenComplete((result, error) -> {
-                // Always clean up the in-flight entry so subsequent
-                // misses trigger a fresh computation.
-                inFlight.remove(key);
-            })
-        );
+        // 2. Slow path — publish a placeholder before scheduling work.
+        // This keeps completion/cleanup out of a computeIfAbsent mapping
+        // function, where an immediately failing task could recursively
+        // update the same ConcurrentHashMap entry.
+        CompletableFuture<V> candidate = new CompletableFuture<>();
+        CompletableFuture<V> existing = inFlight.putIfAbsent(key, candidate);
+        CompletableFuture<V> future = existing;
+
+        if (existing == null) {
+            future = candidate;
+            try {
+                executor.execute(() -> {
+                    V value;
+                    try {
+                        value = loader.apply(key);
+                        // Store result in the real cache (default TTL = 0)
+                        cache.put(key, value, 0);
+                    } catch (Throwable error) {
+                        inFlight.remove(key, candidate);
+                        candidate.completeExceptionally(error);
+                        return;
+                    }
+
+                    // Remove only this computation; a later retry must not
+                    // be removed if it has already replaced this mapping.
+                    inFlight.remove(key, candidate);
+                    candidate.complete(value);
+                });
+            } catch (RuntimeException error) {
+                inFlight.remove(key, candidate);
+                candidate.completeExceptionally(error);
+            }
+        }
 
         // 3. Block until the value is ready.
         //    join() is appropriate here because we want the calling

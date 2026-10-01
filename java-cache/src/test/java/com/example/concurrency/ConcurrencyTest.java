@@ -216,4 +216,33 @@ class ConcurrencyTest {
                 "All requesters should receive the same value");
         assertTrue(uniqueResults.contains("result-for-shared-key"));
     }
+
+    @Test
+    @DisplayName("StampedeGuard: failed load is removed so a later request can retry")
+    void stampedeFailedLoadCanBeRetried() {
+        ShardedCache<String, String> cache = new ShardedCache<>(16);
+        ExecutorService computePool = Executors.newSingleThreadExecutor();
+        StampedeGuard<String, String> guard = new StampedeGuard<>(cache, computePool);
+        AtomicInteger loaderCalls = new AtomicInteger();
+
+        try {
+            assertThrows(CompletionException.class, () -> guard.getOrCompute("retry-key", key -> {
+                loaderCalls.incrementAndGet();
+                throw new IllegalStateException("backend unavailable");
+            }));
+
+            assertNull(cache.get("retry-key"), "Failed loads must not populate the cache");
+            assertEquals("recovered", guard.getOrCompute("retry-key", key -> {
+                loaderCalls.incrementAndGet();
+                return "recovered";
+            }));
+            assertEquals("recovered", guard.getOrCompute("retry-key", key -> {
+                loaderCalls.incrementAndGet();
+                return "unexpected second load";
+            }), "The successful retry should now be cached");
+            assertEquals(2, loaderCalls.get(), "One failed load and one successful retry are expected");
+        } finally {
+            computePool.shutdownNow();
+        }
+    }
 }
