@@ -15,12 +15,14 @@ import java.util.concurrent.*;
  *
  * <h3>Methodology</h3>
  * <ul>
- *   <li>Warm-up phase: run the workload once without measuring, so the
- *       JIT compiler has a chance to optimize hot paths.</li>
- *   <li>Measurement phase: run the workload and record elapsed time
- *       using {@code System.nanoTime()}.</li>
- *   <li>Workload: each thread performs a mix of put (50%) and get (50%)
- *       operations using a uniform random key distribution.</li>
+ *   <li>Each implementation gets a separate warm-up using the measured
+ *       thread count and operation mix.</li>
+ *   <li>Each measured trial uses a fresh cache, and trial order alternates
+ *       to reduce consistent first-run/order bias.</li>
+ *   <li>Each thread performs a deterministic 50/50 put/get mix over the
+ *       same pseudo-random key sequence for both implementations.</li>
+ *   <li>This is an illustrative micro-benchmark, not a substitute for
+ *       JMH or a controlled performance study.</li>
  * </ul>
  *
  * <h3>How to run</h3>
@@ -33,12 +35,6 @@ import java.util.concurrent.*;
  *   java -cp target/classes com.example.benchmark.CacheBenchmark
  * </pre>
  *
- * <h3>Interview talking point</h3>
- * "The benchmark shows that sharding reduces lock contention and
- *  improves throughput roughly linearly with shard count — the same
- *  principle behind ConcurrentHashMap's design.  Under low contention
- *  the difference is small, but under high thread counts the sharded
- *  version clearly wins."
  */
 public class CacheBenchmark {
 
@@ -47,6 +43,7 @@ public class CacheBenchmark {
     private static final int THREAD_COUNT      = 64;
     private static final int OPS_PER_THREAD    = 100_000;
     private static final int WARM_UP_OPS       = 50_000;
+    private static final int MEASURED_RUNS     = 3;
     private static final int KEY_SPACE         = 20_000; // keys drawn from 0..KEY_SPACE-1
 
     public static void main(String[] args) throws Exception {
@@ -58,47 +55,30 @@ public class CacheBenchmark {
         System.out.printf( "║  Total ops:      %-31d║%n", (long) THREAD_COUNT * OPS_PER_THREAD);
         System.out.printf( "║  Cache capacity: %-31d║%n", CACHE_CAPACITY);
         System.out.printf( "║  Key space:      %-31d║%n", KEY_SPACE);
+        System.out.printf( "║  Measured runs:  %-31d║%n", MEASURED_RUNS);
         System.out.println("╚══════════════════════════════════════════════════╝");
         System.out.println();
 
-        // ── Stage 1: Coarse-grained (single lock) ──────────────────
-        System.out.println("── Stage 1: CoarseCache (single ReentrantLock) ──");
-        CoarseCache<Integer, String> coarse = new CoarseCache<>(CACHE_CAPACITY);
+        System.out.println("Warm-up phase (not included in measurements)");
+        runWorkload(new CoarseCache<>(CACHE_CAPACITY), THREAD_COUNT, WARM_UP_OPS);
+        runWorkload(new ShardedCache<>(CACHE_CAPACITY), THREAD_COUNT, WARM_UP_OPS);
 
-        System.out.print("  Warm-up... ");
-        runWorkload(coarse, 1, WARM_UP_OPS);
-        System.out.println("done.");
+        List<Long> coarseRuns = new ArrayList<>();
+        List<Long> shardedRuns = new ArrayList<>();
+        System.out.println("\nMeasurement phase");
+        for (int run = 1; run <= MEASURED_RUNS; run++) {
+            if (run % 2 == 1) {
+                measure("CoarseCache", new CoarseCache<>(CACHE_CAPACITY), run, coarseRuns);
+                measure("ShardedCache", new ShardedCache<>(CACHE_CAPACITY), run, shardedRuns);
+            } else {
+                measure("ShardedCache", new ShardedCache<>(CACHE_CAPACITY), run, shardedRuns);
+                measure("CoarseCache", new CoarseCache<>(CACHE_CAPACITY), run, coarseRuns);
+            }
+        }
 
-        // Reset with a fresh cache for the real measurement
-        coarse = new CoarseCache<>(CACHE_CAPACITY);
-        System.out.print("  Measuring... ");
-        long coarseNanos = runWorkload(coarse, THREAD_COUNT, OPS_PER_THREAD);
-        CacheStats coarseStats = coarse.stats();
-        printResult(coarseNanos, coarseStats);
-
-        System.out.println();
-
-        // ── Stage 2: Sharded (16 segments) ──────────────────────────
-        System.out.println("── Stage 2: ShardedCache (16 segments) ──");
-        ShardedCache<Integer, String> sharded = new ShardedCache<>(CACHE_CAPACITY);
-
-        System.out.print("  Warm-up... ");
-        runWorkload(sharded, 1, WARM_UP_OPS);
-        System.out.println("done.");
-
-        sharded = new ShardedCache<>(CACHE_CAPACITY);
-        System.out.print("  Measuring... ");
-        long shardedNanos = runWorkload(sharded, THREAD_COUNT, OPS_PER_THREAD);
-        CacheStats shardedStats = sharded.stats();
-        printResult(shardedNanos, shardedStats);
-
-        System.out.println();
-
-        // ── Comparison ──────────────────────────────────────────────
-        double speedup = (double) coarseNanos / shardedNanos;
-        System.out.println("══════════════════════════════════════════════════");
-        System.out.printf( "  Speedup (sharded / coarse): %.2fx%n", speedup);
-        System.out.println("══════════════════════════════════════════════════");
+        System.out.println("\nAverage across measured runs");
+        printAverage("CoarseCache", coarseRuns);
+        printAverage("ShardedCache", shardedRuns);
     }
 
     /**
@@ -118,7 +98,12 @@ public class CacheBenchmark {
         for (int t = 0; t < threadCount; t++) {
             final int seed = t;
             futures.add(pool.submit(() -> {
-                try { startGun.await(); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+                try {
+                    startGun.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new RuntimeException("Interrupted while waiting to start", e);
+                }
 
                 // Simple pseudo-random (xorshift) to avoid ThreadLocalRandom overhead
                 int rng = seed + 1;
@@ -137,16 +122,25 @@ public class CacheBenchmark {
             }));
         }
 
-        long start = System.nanoTime();
-        startGun.countDown();
+        try {
+            long start = System.nanoTime();
+            startGun.countDown();
 
-        for (Future<?> f : futures) {
-            f.get(120, TimeUnit.SECONDS);
+            for (Future<?> f : futures) {
+                f.get(120, TimeUnit.SECONDS);
+            }
+            return System.nanoTime() - start;
+        } finally {
+            pool.shutdownNow();
         }
-        long elapsed = System.nanoTime() - start;
+    }
 
-        pool.shutdown();
-        return elapsed;
+    private static void measure(String name, Cache<Integer, String> cache,
+                                int run, List<Long> durations) throws Exception {
+        long nanos = runWorkload(cache, THREAD_COUNT, OPS_PER_THREAD);
+        durations.add(nanos);
+        System.out.printf("%s run %d/%d%n", name, run, MEASURED_RUNS);
+        printResult(nanos, cache.stats());
     }
 
     private static void printResult(long nanos, CacheStats stats) {
@@ -154,9 +148,22 @@ public class CacheBenchmark {
         double seconds = nanos / 1_000_000_000.0;
         double opsPerSec = totalOps / seconds;
 
-        System.out.printf("done in %.3f s%n", seconds);
+        System.out.printf("  Operations:  %,d%n", totalOps);
+        System.out.printf("  Elapsed:     %.3f s%n", seconds);
         System.out.printf("  Throughput:  %,.0f ops/sec%n", opsPerSec);
         System.out.printf("  Hits: %,d  |  Misses: %,d  |  Evictions: %,d  |  Size: %,d%n",
                 stats.hits(), stats.misses(), stats.evictions(), stats.size());
+    }
+
+    private static void printAverage(String name, List<Long> durations) {
+        long totalOps = (long) THREAD_COUNT * OPS_PER_THREAD;
+        double averageNanos = durations.stream().mapToLong(Long::longValue).average().orElseThrow();
+        double averageThroughput = durations.stream()
+                .mapToDouble(nanos -> totalOps / (nanos / 1_000_000_000.0))
+                .average()
+                .orElseThrow();
+
+        System.out.printf("  %s: average elapsed %.3f s, average throughput %,.0f ops/sec (%d runs)%n",
+                name, averageNanos / 1_000_000_000.0, averageThroughput, durations.size());
     }
 }
