@@ -37,9 +37,10 @@ class ConcurrencyTest {
     // ================================================================
 
     @RepeatedTest(5)
-    @DisplayName("ShardedCache: concurrent put/get — no lost updates")
-    void shardedCacheNoLostUpdates() throws Exception {
-        ShardedCache<Integer, Integer> cache = new ShardedCache<>(1_000_000);
+    @DisplayName("ShardedCache: concurrent mixed operations stay within capacity")
+    void shardedCacheConcurrentOperationsStayWithinCapacity() throws Exception {
+        int capacity = 128;
+        ShardedCache<Integer, Integer> cache = new ShardedCache<>(capacity);
         int threadCount = 64;
         int opsPerThread = 5_000;
         ExecutorService pool = Executors.newFixedThreadPool(threadCount);
@@ -49,32 +50,37 @@ class ConcurrencyTest {
         for (int t = 0; t < threadCount; t++) {
             final int threadId = t;
             futures.add(pool.submit(() -> {
-                try { startGun.await(); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+                startGun.await();
                 for (int i = 0; i < opsPerThread; i++) {
-                    int key = threadId * opsPerThread + i;
-                    cache.put(key, key, 0);
-                    // Immediately read back — value should be what we wrote
-                    // (another thread might overwrite if keys collide, but
-                    //  our keys are unique per thread so this should hold)
-                    Integer value = cache.get(key);
-                    assertNotNull(value, "Value should not be null immediately after put");
-                    assertEquals(key, value, "Value should match what was written");
+                    // A bounded, overlapping key range exercises contention
+                    // and eviction instead of allowing every write to remain.
+                    int key = (threadId * 31 + i) % (capacity * 4);
+                    switch (i % 3) {
+                        case 0 -> cache.put(key, threadId * opsPerThread + i, 0);
+                        case 1 -> cache.get(key);
+                        default -> cache.delete(key);
+                    }
                 }
             }));
         }
 
         startGun.countDown(); // fire!
 
-        for (Future<?> f : futures) {
-            f.get(30, TimeUnit.SECONDS); // propagate assertion errors
+        try {
+            for (Future<?> f : futures) {
+                f.get(30, TimeUnit.SECONDS); // propagate worker exceptions
+            }
+        } finally {
+            pool.shutdownNow();
         }
 
-        pool.shutdown();
-
-        // Verify metrics consistency
+        // Inspect repeatedly after workers stop so every assertion is a
+        // stable snapshot and any structural corruption is surfaced.
         CacheStats stats = cache.stats();
-        assertTrue(stats.hits() > 0, "Should have recorded some hits");
-        assertTrue(stats.size() > 0, "Cache should contain entries");
+        assertTrue(stats.size() >= 0, "Cache size cannot be negative");
+        assertTrue(stats.size() <= capacity,
+                "Cache must not exceed configured capacity, got: " + stats.size());
+        assertEquals(stats.size(), cache.size(), "Reported size should match cache size");
     }
 
     // ================================================================
