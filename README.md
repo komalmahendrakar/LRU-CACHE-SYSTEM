@@ -133,19 +133,20 @@ Results from running on the local machine (results will vary by hardware):
 Run the benchmark with:
   mvn compile exec:java -Dexec.mainClass="com.example.benchmark.CacheBenchmark"
 
-The benchmark compares two stages:
+Config: 64 threads · 100,000 ops/thread · 6,400,000 total ops
+        Cache capacity: 10,000  |  Key space: 20,000
+
+Stage 1 – CoarseCache (single ReentrantLock)
+  Throughput: 2,585,793 ops/sec
+  Time: 2.475 s
+  Hits: 1,597,738 | Misses: 1,602,262 | Evictions: 1,592,861 | Size: 10,000
 
 Stage 2 – ShardedCache (16 segments)
-  Throughput: 3,889,089 ops/sec
-  Time: 1.646 s
-  Hits: 1,597,260 | Misses: 1,602,740 | Evictions: 1,591,659 | Size: 10,000
+  Throughput: 4,568,832 ops/sec
+  Time: 1.401 s
+  Hits: 1,595,620 | Misses: 1,604,380 | Evictions: 1,592,392 | Size: 10,000
 
-Stage 1 – CoarseCache (single lock)
-  Throughput: 2,327,790 ops/sec
-  Time: 2.749 s
-  Hits: 1,596,673 | Misses: 1,603,327 | Evictions: 1,592,006 | Size: 10,000
-
-Speedup (sharded / coarse): 1.67×
+Speedup (sharded / coarse): 1.77×
 ```
 
 ---

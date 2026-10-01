@@ -66,7 +66,7 @@ public class CacheBenchmark {
         CoarseCache<Integer, String> coarse = new CoarseCache<>(CACHE_CAPACITY);
 
         System.out.print("  Warm-up... ");
-        runWorkload(coarse, 1, WARM_UP_OPS);
+        runWorkload(coarse, THREAD_COUNT, WARM_UP_OPS);
         System.out.println("done.");
 
         // Reset with a fresh cache for the real measurement
@@ -83,7 +83,7 @@ public class CacheBenchmark {
         ShardedCache<Integer, String> sharded = new ShardedCache<>(CACHE_CAPACITY);
 
         System.out.print("  Warm-up... ");
-        runWorkload(sharded, 1, WARM_UP_OPS);
+        runWorkload(sharded, THREAD_COUNT, WARM_UP_OPS);
         System.out.println("done.");
 
         sharded = new ShardedCache<>(CACHE_CAPACITY);
